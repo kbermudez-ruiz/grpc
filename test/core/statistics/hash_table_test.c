@@ -1,33 +1,18 @@
 /*
  *
- * Copyright 2015, Google Inc.
- * All rights reserved.
+ * Copyright 2015 gRPC authors.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     * Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following disclaimer
- * in the documentation and/or other materials provided with the
- * distribution.
- *     * Neither the name of Google Inc. nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  */
 
@@ -35,13 +20,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "src/core/statistics/hash_table.h"
+#include "src/core/ext/census/hash_table.h"
 
-#include "src/core/support/murmur_hash.h"
-#include "src/core/support/string.h"
 #include <grpc/support/alloc.h>
 #include <grpc/support/log.h>
 #include <grpc/support/time.h>
+#include "src/core/lib/support/murmur_hash.h"
+#include "src/core/lib/support/string.h"
 #include "test/core/util/test_config.h"
 
 static uint64_t hash64(const void *k) {
@@ -65,8 +50,8 @@ static void free_data(void *data) { gpr_free(data); }
 static void test_create_table(void) {
   /* Create table with uint64 key type */
   census_ht *ht = NULL;
-  census_ht_option ht_options = {CENSUS_HT_UINT64, 1999, NULL, NULL, NULL,
-                                 NULL};
+  census_ht_option ht_options = {
+      CENSUS_HT_UINT64, 1999, NULL, NULL, NULL, NULL};
   ht = census_ht_create(&ht_options);
   GPR_ASSERT(ht != NULL);
   GPR_ASSERT(census_ht_get_size(ht) == 0);
@@ -120,8 +105,8 @@ static void test_table_with_int_key(void) {
 
 /* Test that there is no memory leak when keys and values are owned by table. */
 static void test_value_and_key_deleter(void) {
-  census_ht_option opt = {CENSUS_HT_POINTER, 7, &hash64, &cmp_str_keys,
-                          &free_data, &free_data};
+  census_ht_option opt = {CENSUS_HT_POINTER, 7,          &hash64,
+                          &cmp_str_keys,     &free_data, &free_data};
   census_ht *ht = census_ht_create(&opt);
   census_ht_key key;
   char *val = NULL;
@@ -185,8 +170,8 @@ static void test_simple_add_and_erase(void) {
 }
 
 static void test_insertion_and_deletion_with_high_collision_rate(void) {
-  census_ht_option opt = {CENSUS_HT_POINTER, 13, &force_collision,
-                          &cmp_str_keys, NULL, NULL};
+  census_ht_option opt = {CENSUS_HT_POINTER, 13,   &force_collision,
+                          &cmp_str_keys,     NULL, NULL};
   census_ht *ht = census_ht_create(&opt);
   char key_str[1000][GPR_LTOA_MIN_BUFSIZE];
   uint64_t val = 0;
@@ -209,12 +194,12 @@ static void test_insertion_and_deletion_with_high_collision_rate(void) {
 }
 
 static void test_table_with_string_key(void) {
-  census_ht_option opt = {CENSUS_HT_POINTER, 7, &hash64, &cmp_str_keys, NULL,
-                          NULL};
+  census_ht_option opt = {CENSUS_HT_POINTER, 7,    &hash64,
+                          &cmp_str_keys,     NULL, NULL};
   census_ht *ht = census_ht_create(&opt);
-  const char *keys[] = {"k1", "a", "000", "apple",
-                        "banana_a_long_long_long_banana", "%$", "111", "foo",
-                        "b"};
+  const char *keys[] = {
+      "k1", "a",   "000", "apple", "banana_a_long_long_long_banana",
+      "%$", "111", "foo", "b"};
   const int vals[] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
   int i = 0;
   GPR_ASSERT(ht != NULL);

@@ -2,13 +2,18 @@
   "name": "grpc/grpc",
   "type": "library",
   "description": "gRPC library for PHP",
-  "version": "0.6.0",
   "keywords": ["rpc"],
-  "homepage": "http://grpc.io",
-  "license": "BSD-3-Clause",
+  "homepage": "https://grpc.io",
+  "license": "Apache-2.0",
   "require": {
-    "php": ">=5.5.0",
-    "google/auth": "dev-master"
+    "php": ">=5.5.0"
+  },
+  "require-dev": {
+    "google/auth": "v0.9"
+  },
+  "suggest": {
+    "ext-protobuf": "For better performance, install the protobuf C extension.",
+    "google/protobuf": "To get started using grpc quickly, install the native protobuf library."
   },
   "autoload": {
     "psr-4": {

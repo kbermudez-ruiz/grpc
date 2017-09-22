@@ -1,66 +1,64 @@
 /*
  *
- * Copyright 2015, Google Inc.
- * All rights reserved.
+ * Copyright 2015 gRPC authors.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     * Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following disclaimer
- * in the documentation and/or other materials provided with the
- * distribution.
- *     * Neither the name of Google Inc. nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  */
 
 #import "GRPCHost.h"
 
 #include <grpc/grpc.h>
+#include <grpc/grpc_security.h>
+#import <GRPCClient/GRPCCall.h>
+#ifdef GRPC_COMPILE_WITH_CRONET
 #import <GRPCClient/GRPCCall+ChannelArg.h>
+#import <GRPCClient/GRPCCall+Cronet.h>
+#endif
 
 #import "GRPCChannel.h"
 #import "GRPCCompletionQueue.h"
+#import "GRPCConnectivityMonitor.h"
 #import "NSDictionary+GRPC.h"
+#import "version.h"
 
-// TODO(jcanizales): Generate the version in a standalone header, from templates. Like
-// templates/src/core/surface/version.c.template .
-#define GRPC_OBJC_VERSION_STRING @"0.13.0"
+NS_ASSUME_NONNULL_BEGIN
 
-@interface GRPCHost ()
-// TODO(mlumish): Investigate whether caching channels with strong links is a good idea.
-@property(nonatomic, strong) GRPCChannel *channel;
-@end
+static NSMutableDictionary *kHostCache;
 
-@implementation GRPCHost
+// This connectivity monitor flushes the host cache when connectivity status
+// changes or when connection switch between Wifi and Cellular data, so that a
+// new call will use a new channel. Otherwise, a new call will still use the
+// cached channel which is no longer available and will cause gRPC to hang.
+static GRPCConnectivityMonitor *connectivityMonitor = nil;
 
-+ (instancetype)hostWithAddress:(NSString *)address {
+@implementation GRPCHost {
+  // TODO(mlumish): Investigate whether caching channels with strong links is a good idea.
+  GRPCChannel *_channel;
+}
+
++ (nullable instancetype)hostWithAddress:(NSString *)address {
   return [[self alloc] initWithAddress:address];
 }
 
-- (instancetype)init {
-  return [self initWithAddress:nil];
+- (void)dealloc {
+  if (_channelCreds != nil) {
+    grpc_channel_credentials_release(_channelCreds);
+  }
 }
 
 // Default initializer.
-- (instancetype)initWithAddress:(NSString *)address {
+- (nullable instancetype)initWithAddress:(NSString *)address {
   if (!address) {
     return nil;
   }
@@ -75,13 +73,12 @@
   }
 
   // Look up the GRPCHost in the cache.
-  static NSMutableDictionary *hostCache;
   static dispatch_once_t cacheInitialization;
   dispatch_once(&cacheInitialization, ^{
-    hostCache = [NSMutableDictionary dictionary];
+    kHostCache = [NSMutableDictionary dictionary];
   });
-  @synchronized(hostCache) {
-    GRPCHost *cachedHost = hostCache[address];
+  @synchronized(kHostCache) {
+    GRPCHost *cachedHost = kHostCache[address];
     if (cachedHost) {
       return cachedHost;
     }
@@ -89,52 +86,176 @@
     if ((self = [super init])) {
       _address = address;
       _secure = YES;
-      hostCache[address] = self;
+      kHostCache[address] = self;
+    }
+    // Keep a single monitor to flush the cache if the connectivity status changes
+    // Thread safety guarded by @synchronized(kHostCache)
+    if (!connectivityMonitor) {
+      connectivityMonitor =
+      [GRPCConnectivityMonitor monitorWithHost:hostURL.host];
+      void (^handler)() = ^{
+        [GRPCHost flushChannelCache];
+      };
+      [connectivityMonitor handleLossWithHandler:handler
+                         wifiStatusChangeHandler:handler];
     }
   }
   return self;
 }
 
-- (grpc_call *)unmanagedCallWithPath:(NSString *)path completionQueue:(GRPCCompletionQueue *)queue {
-  if (!queue || !path || !self.channel) {
-    return NULL;
++ (void)flushChannelCache {
+  @synchronized(kHostCache) {
+    [kHostCache enumerateKeysAndObjectsUsingBlock:^(id  _Nonnull key,
+                                                    GRPCHost * _Nonnull host,
+                                                    BOOL * _Nonnull stop) {
+      [host disconnect];
+    }];
   }
-  return grpc_channel_create_call(self.channel.unmanagedChannel,
-                                  NULL, GRPC_PROPAGATE_DEFAULTS,
-                                  queue.unmanagedQueue,
-                                  path.UTF8String,
-                                  self.hostName.UTF8String,
-                                  gpr_inf_future(GPR_CLOCK_REALTIME), NULL);
 }
 
-- (GRPCChannel *)channel {
-  // Create it lazily, because we don't want to open a connection just because someone is
-  // configuring a host.
-
-  if (!_channel) {
-    NSMutableDictionary *args = [NSMutableDictionary dictionary];
-
-    // TODO(jcanizales): Add OS and device information (see
-    // https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#user-agents ).
-    NSString *userAgent = @"grpc-objc/" GRPC_OBJC_VERSION_STRING;
-    if (_userAgentPrefix) {
-      userAgent = [@[_userAgentPrefix, userAgent] componentsJoinedByString:@" "];
-    }
-    args[@GRPC_ARG_PRIMARY_USER_AGENT_STRING] = userAgent;
-
-    if (_secure) {
-      if (_hostNameOverride) {
-        args[@GRPC_SSL_TARGET_NAME_OVERRIDE_ARG] = _hostNameOverride;
-      }
-
-      _channel = [GRPCChannel secureChannelWithHost:_address
-                                 pathToCertificates:_pathToCertificates
-                                        channelArgs:args];
-    } else {
-      _channel = [GRPCChannel insecureChannelWithHost:_address channelArgs:args];
-    }
++ (void)resetAllHostSettings {
+  @synchronized (kHostCache) {
+    kHostCache = [NSMutableDictionary dictionary];
   }
-  return _channel;
+}
+
+- (nullable grpc_call *)unmanagedCallWithPath:(NSString *)path
+                                   serverName:(NSString *)serverName
+                                      timeout:(NSTimeInterval)timeout
+                              completionQueue:(GRPCCompletionQueue *)queue {
+  GRPCChannel *channel;
+  // This is racing -[GRPCHost disconnect].
+  @synchronized(self) {
+    if (!_channel) {
+      _channel = [self newChannel];
+    }
+    channel = _channel;
+  }
+  return [channel unmanagedCallWithPath:path
+                             serverName:serverName
+                                timeout:timeout
+                        completionQueue:queue];
+}
+
+- (BOOL)setTLSPEMRootCerts:(nullable NSString *)pemRootCerts
+            withPrivateKey:(nullable NSString *)pemPrivateKey
+             withCertChain:(nullable NSString *)pemCertChain
+                     error:(NSError **)errorPtr {
+  static NSData *kDefaultRootsASCII;
+  static NSError *kDefaultRootsError;
+  static dispatch_once_t loading;
+  dispatch_once(&loading, ^{
+    NSString *defaultPath = @"gRPCCertificates.bundle/roots"; // .pem
+    // Do not use NSBundle.mainBundle, as it's nil for tests of library projects.
+    NSBundle *bundle = [NSBundle bundleForClass:self.class];
+    NSString *path = [bundle pathForResource:defaultPath ofType:@"pem"];
+    NSError *error;
+    // Files in PEM format can have non-ASCII characters in their comments (e.g. for the name of the
+    // issuer). Load them as UTF8 and produce an ASCII equivalent.
+    NSString *contentInUTF8 = [NSString stringWithContentsOfFile:path
+                                                        encoding:NSUTF8StringEncoding
+                                                           error:&error];
+    if (contentInUTF8 == nil) {
+      kDefaultRootsError = error;
+      return;
+    }
+    kDefaultRootsASCII = [contentInUTF8 dataUsingEncoding:NSASCIIStringEncoding
+                                     allowLossyConversion:YES];
+  });
+
+  NSData *rootsASCII;
+  if (pemRootCerts != nil) {
+    rootsASCII = [pemRootCerts dataUsingEncoding:NSASCIIStringEncoding
+                            allowLossyConversion:YES];
+  } else {
+    if (kDefaultRootsASCII == nil) {
+      if (errorPtr) {
+        *errorPtr = kDefaultRootsError;
+      }
+      NSAssert(kDefaultRootsASCII, @"Could not read gRPCCertificates.bundle/roots.pem. This file, "
+               "with the root certificates, is needed to establish secure (TLS) connections. "
+               "Because the file is distributed with the gRPC library, this error is usually a sign "
+               "that the library wasn't configured correctly for your project. Error: %@",
+                kDefaultRootsError);
+      return NO;
+    }
+    rootsASCII = kDefaultRootsASCII;
+  }
+
+  grpc_channel_credentials *creds;
+  if (pemPrivateKey == nil && pemCertChain == nil) {
+    creds = grpc_ssl_credentials_create(rootsASCII.bytes, NULL, NULL);
+  } else {
+    grpc_ssl_pem_key_cert_pair key_cert_pair;
+    NSData *privateKeyASCII = [pemPrivateKey dataUsingEncoding:NSASCIIStringEncoding
+                                       allowLossyConversion:YES];
+    NSData *certChainASCII = [pemCertChain dataUsingEncoding:NSASCIIStringEncoding
+                                     allowLossyConversion:YES];
+    key_cert_pair.private_key = privateKeyASCII.bytes;
+    key_cert_pair.cert_chain = certChainASCII.bytes;
+    creds = grpc_ssl_credentials_create(rootsASCII.bytes, &key_cert_pair, NULL);
+  }
+
+  @synchronized(self) {
+    if (_channelCreds != nil) {
+      grpc_channel_credentials_release(_channelCreds);
+    }
+    _channelCreds = creds;
+  }
+
+  return YES;
+}
+
+- (NSDictionary *)channelArgs {
+  NSMutableDictionary *args = [NSMutableDictionary dictionary];
+
+  // TODO(jcanizales): Add OS and device information (see
+  // https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md#user-agents ).
+  NSString *userAgent = @"grpc-objc/" GRPC_OBJC_VERSION_STRING;
+  if (_userAgentPrefix) {
+    userAgent = [_userAgentPrefix stringByAppendingFormat:@" %@", userAgent];
+  }
+  args[@GRPC_ARG_PRIMARY_USER_AGENT_STRING] = userAgent;
+
+  if (_secure && _hostNameOverride) {
+    args[@GRPC_SSL_TARGET_NAME_OVERRIDE_ARG] = _hostNameOverride;
+  }
+
+  if (_responseSizeLimitOverride) {
+    args[@GRPC_ARG_MAX_RECEIVE_MESSAGE_LENGTH] = _responseSizeLimitOverride;
+  }
+  // Use 10000ms initial backoff time for correct behavior on bad/slow networks  
+  args[@GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS] = @10000;
+  return args;
+}
+
+- (GRPCChannel *)newChannel {
+  NSDictionary *args = [self channelArgs];
+#ifdef GRPC_COMPILE_WITH_CRONET
+  BOOL useCronet = [GRPCCall isUsingCronet];
+#endif
+  if (_secure) {
+    GRPCChannel *channel;
+    @synchronized(self) {
+      if (_channelCreds == nil) {
+        [self setTLSPEMRootCerts:nil withPrivateKey:nil withCertChain:nil error:nil];
+      }
+#ifdef GRPC_COMPILE_WITH_CRONET
+      if (useCronet) {
+        channel = [GRPCChannel secureCronetChannelWithHost:_address
+                                               channelArgs:args];
+      } else
+#endif
+      {
+        channel = [GRPCChannel secureChannelWithHost:_address
+                                         credentials:_channelCreds
+                                         channelArgs:args];
+      }
+    }
+    return channel;
+  } else {
+    return [GRPCChannel insecureChannelWithHost:_address channelArgs:args];
+  }
 }
 
 - (NSString *)hostName {
@@ -142,7 +263,13 @@
   return _hostNameOverride ?: _address;
 }
 
-// TODO(jcanizales): Don't let set |secure| to |NO| if |pathToCertificates| or |hostNameOverride|
-// have been set. Don't let set either of the latter if |secure| has been set to |NO|.
+- (void)disconnect {
+  // This is racing -[GRPCHost unmanagedCallWithPath:completionQueue:].
+  @synchronized(self) {
+    _channel = nil;
+  }
+}
 
 @end
+
+NS_ASSUME_NONNULL_END

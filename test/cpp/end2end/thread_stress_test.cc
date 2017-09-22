@@ -1,33 +1,18 @@
 /*
  *
- * Copyright 2015-2016, Google Inc.
- * All rights reserved.
+ * Copyright 2015 gRPC authors.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     * Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following disclaimer
- * in the documentation and/or other materials provided with the
- * distribution.
- *     * Neither the name of Google Inc. nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  */
 
@@ -43,20 +28,24 @@
 #include <grpc/grpc.h>
 #include <grpc/support/thd.h>
 #include <grpc/support/time.h>
-#include <gtest/gtest.h>
 
-#include "src/core/surface/api_trace.h"
+#include "src/core/lib/surface/api_trace.h"
 #include "src/proto/grpc/testing/duplicate/echo_duplicate.grpc.pb.h"
 #include "src/proto/grpc/testing/echo.grpc.pb.h"
 #include "test/core/util/port.h"
 #include "test/core/util/test_config.h"
+
+#include <gtest/gtest.h>
 
 using grpc::testing::EchoRequest;
 using grpc::testing::EchoResponse;
 using std::chrono::system_clock;
 
 const int kNumThreads = 100;  // Number of threads
-const int kNumRpcs = 1000;    // Number of RPCs per thread
+const int kNumAsyncSendThreads = 2;
+const int kNumAsyncReceiveThreads = 50;
+const int kNumAsyncServerThreads = 50;
+const int kNumRpcs = 1000;  // Number of RPCs per thread
 
 namespace grpc {
 namespace testing {
@@ -83,12 +72,12 @@ class TestServiceImpl : public ::grpc::testing::EchoTestService::Service {
   TestServiceImpl() : signal_client_(false) {}
 
   Status Echo(ServerContext* context, const EchoRequest* request,
-              EchoResponse* response) GRPC_OVERRIDE {
+              EchoResponse* response) override {
     response->set_message(request->message());
     MaybeEchoDeadline(context, request, response);
     if (request->has_param() && request->param().client_cancel_after_us()) {
       {
-        unique_lock<mutex> lock(mu_);
+        std::unique_lock<std::mutex> lock(mu_);
         signal_client_ = true;
       }
       while (!context->IsCancelled()) {
@@ -115,7 +104,7 @@ class TestServiceImpl : public ::grpc::testing::EchoTestService::Service {
 
   Status RequestStream(ServerContext* context,
                        ServerReader<EchoRequest>* reader,
-                       EchoResponse* response) GRPC_OVERRIDE {
+                       EchoResponse* response) override {
     EchoRequest request;
     response->set_message("");
     while (reader->Read(&request)) {
@@ -127,7 +116,7 @@ class TestServiceImpl : public ::grpc::testing::EchoTestService::Service {
   // Return 3 messages.
   // TODO(yangg) make it generic by adding a parameter into EchoRequest
   Status ResponseStream(ServerContext* context, const EchoRequest* request,
-                        ServerWriter<EchoResponse>* writer) GRPC_OVERRIDE {
+                        ServerWriter<EchoResponse>* writer) override {
     EchoResponse response;
     response.set_message(request->message() + "0");
     writer->Write(response);
@@ -139,9 +128,9 @@ class TestServiceImpl : public ::grpc::testing::EchoTestService::Service {
     return Status::OK;
   }
 
-  Status BidiStream(ServerContext* context,
-                    ServerReaderWriter<EchoResponse, EchoRequest>* stream)
-      GRPC_OVERRIDE {
+  Status BidiStream(
+      ServerContext* context,
+      ServerReaderWriter<EchoResponse, EchoRequest>* stream) override {
     EchoRequest request;
     EchoResponse response;
     while (stream->Read(&request)) {
@@ -153,66 +142,196 @@ class TestServiceImpl : public ::grpc::testing::EchoTestService::Service {
   }
 
   bool signal_client() {
-    unique_lock<mutex> lock(mu_);
+    std::unique_lock<std::mutex> lock(mu_);
     return signal_client_;
   }
 
  private:
   bool signal_client_;
-  mutex mu_;
+  std::mutex mu_;
 };
 
-class TestServiceImplDupPkg
-    : public ::grpc::testing::duplicate::EchoTestService::Service {
- public:
-  Status Echo(ServerContext* context, const EchoRequest* request,
-              EchoResponse* response) GRPC_OVERRIDE {
-    response->set_message("no package");
-    return Status::OK;
-  }
-};
-
+template <class Service>
 class CommonStressTest {
  public:
   CommonStressTest() : kMaxMessageSize_(8192) {}
-  void SetUp() {
-    int port = grpc_pick_unused_port_or_die();
-    server_address_ << "localhost:" << port;
-    // Setup server
-    ServerBuilder builder;
-    builder.AddListeningPort(server_address_.str(),
-                             InsecureServerCredentials());
-    builder.RegisterService(&service_);
-    builder.SetMaxMessageSize(
-        kMaxMessageSize_);  // For testing max message size.
-    builder.RegisterService(&dup_pkg_service_);
-    server_ = builder.BuildAndStart();
-  }
-  void TearDown() { server_->Shutdown(); }
-  void ResetStub() {
-    std::shared_ptr<Channel> channel =
-        CreateChannel(server_address_.str(), InsecureChannelCredentials());
-    stub_ = grpc::testing::EchoTestService::NewStub(channel);
-  }
+  virtual ~CommonStressTest() {}
+  virtual void SetUp() = 0;
+  virtual void TearDown() = 0;
+  virtual void ResetStub() = 0;
   grpc::testing::EchoTestService::Stub* GetStub() { return stub_.get(); }
 
- private:
+ protected:
   std::unique_ptr<grpc::testing::EchoTestService::Stub> stub_;
   std::unique_ptr<Server> server_;
-  std::ostringstream server_address_;
+
+  virtual void SetUpStart(ServerBuilder* builder, Service* service) = 0;
+  void SetUpStartCommon(ServerBuilder* builder, Service* service) {
+    builder->RegisterService(service);
+    builder->SetMaxMessageSize(
+        kMaxMessageSize_);  // For testing max message size.
+  }
+  void SetUpEnd(ServerBuilder* builder) { server_ = builder->BuildAndStart(); }
+  void TearDownStart() { server_->Shutdown(); }
+  void TearDownEnd() {}
+
+ private:
   const int kMaxMessageSize_;
-  TestServiceImpl service_;
-  TestServiceImplDupPkg dup_pkg_service_;
 };
 
+template <class Service>
+class CommonStressTestInsecure : public CommonStressTest<Service> {
+ public:
+  void ResetStub() override {
+    std::shared_ptr<Channel> channel =
+        CreateChannel(server_address_.str(), InsecureChannelCredentials());
+    this->stub_ = grpc::testing::EchoTestService::NewStub(channel);
+  }
+
+ protected:
+  void SetUpStart(ServerBuilder* builder, Service* service) override {
+    int port = grpc_pick_unused_port_or_die();
+    this->server_address_ << "localhost:" << port;
+    // Setup server
+    builder->AddListeningPort(server_address_.str(),
+                              InsecureServerCredentials());
+    this->SetUpStartCommon(builder, service);
+  }
+
+ private:
+  std::ostringstream server_address_;
+};
+
+template <class Service>
+class CommonStressTestInproc : public CommonStressTest<Service> {
+ public:
+  void ResetStub() override {
+    ChannelArguments args;
+    std::shared_ptr<Channel> channel = this->server_->InProcessChannel(args);
+    this->stub_ = grpc::testing::EchoTestService::NewStub(channel);
+  }
+
+ protected:
+  void SetUpStart(ServerBuilder* builder, Service* service) override {
+    this->SetUpStartCommon(builder, service);
+  }
+};
+
+template <class BaseClass>
+class CommonStressTestSyncServer : public BaseClass {
+ public:
+  void SetUp() override {
+    ServerBuilder builder;
+    this->SetUpStart(&builder, &service_);
+    this->SetUpEnd(&builder);
+  }
+  void TearDown() override {
+    this->TearDownStart();
+    this->TearDownEnd();
+  }
+
+ private:
+  TestServiceImpl service_;
+};
+
+template <class BaseClass>
+class CommonStressTestAsyncServer : public BaseClass {
+ public:
+  CommonStressTestAsyncServer() : contexts_(kNumAsyncServerThreads * 100) {}
+  void SetUp() override {
+    shutting_down_ = false;
+    ServerBuilder builder;
+    this->SetUpStart(&builder, &service_);
+    cq_ = builder.AddCompletionQueue();
+    this->SetUpEnd(&builder);
+    for (int i = 0; i < kNumAsyncServerThreads * 100; i++) {
+      RefreshContext(i);
+    }
+    for (int i = 0; i < kNumAsyncServerThreads; i++) {
+      server_threads_.emplace_back(&CommonStressTestAsyncServer::ProcessRpcs,
+                                   this);
+    }
+  }
+  void TearDown() override {
+    {
+      std::unique_lock<std::mutex> l(mu_);
+      this->TearDownStart();
+      shutting_down_ = true;
+      cq_->Shutdown();
+    }
+
+    for (int i = 0; i < kNumAsyncServerThreads; i++) {
+      server_threads_[i].join();
+    }
+
+    void* ignored_tag;
+    bool ignored_ok;
+    while (cq_->Next(&ignored_tag, &ignored_ok))
+      ;
+    this->TearDownEnd();
+  }
+
+ private:
+  void ProcessRpcs() {
+    void* tag;
+    bool ok;
+    while (cq_->Next(&tag, &ok)) {
+      if (ok) {
+        int i = static_cast<int>(reinterpret_cast<intptr_t>(tag));
+        switch (contexts_[i].state) {
+          case Context::READY: {
+            contexts_[i].state = Context::DONE;
+            EchoResponse send_response;
+            send_response.set_message(contexts_[i].recv_request.message());
+            contexts_[i].response_writer->Finish(send_response, Status::OK,
+                                                 tag);
+            break;
+          }
+          case Context::DONE:
+            RefreshContext(i);
+            break;
+        }
+      }
+    }
+  }
+  void RefreshContext(int i) {
+    std::unique_lock<std::mutex> l(mu_);
+    if (!shutting_down_) {
+      contexts_[i].state = Context::READY;
+      contexts_[i].srv_ctx.reset(new ServerContext);
+      contexts_[i].response_writer.reset(
+          new grpc::ServerAsyncResponseWriter<EchoResponse>(
+              contexts_[i].srv_ctx.get()));
+      service_.RequestEcho(contexts_[i].srv_ctx.get(),
+                           &contexts_[i].recv_request,
+                           contexts_[i].response_writer.get(), cq_.get(),
+                           cq_.get(), (void*)(intptr_t)i);
+    }
+  }
+  struct Context {
+    std::unique_ptr<ServerContext> srv_ctx;
+    std::unique_ptr<grpc::ServerAsyncResponseWriter<EchoResponse>>
+        response_writer;
+    EchoRequest recv_request;
+    enum { READY, DONE } state;
+  };
+  std::vector<Context> contexts_;
+  ::grpc::testing::EchoTestService::AsyncService service_;
+  std::unique_ptr<ServerCompletionQueue> cq_;
+  bool shutting_down_;
+  std::mutex mu_;
+  std::vector<std::thread> server_threads_;
+};
+
+template <class Common>
 class End2endTest : public ::testing::Test {
  protected:
   End2endTest() {}
-  void SetUp() GRPC_OVERRIDE { common_.SetUp(); }
-  void TearDown() GRPC_OVERRIDE { common_.TearDown(); }
+  void SetUp() override { common_.SetUp(); }
+  void TearDown() override { common_.TearDown(); }
   void ResetStub() { common_.ResetStub(); }
 
-  CommonStressTest common_;
+  Common common_;
 };
 
 static void SendRpc(grpc::testing::EchoTestService::Stub* stub, int num_rpcs) {
@@ -224,28 +343,41 @@ static void SendRpc(grpc::testing::EchoTestService::Stub* stub, int num_rpcs) {
     ClientContext context;
     Status s = stub->Echo(&context, request, &response);
     EXPECT_EQ(response.message(), request.message());
-    EXPECT_TRUE(s.ok());
+    if (!s.ok()) {
+      gpr_log(GPR_ERROR, "RPC error: %d: %s", s.error_code(),
+              s.error_message().c_str());
+    }
+    ASSERT_TRUE(s.ok());
   }
 }
 
-TEST_F(End2endTest, ThreadStress) {
-  common_.ResetStub();
-  std::vector<std::thread*> threads;
+typedef ::testing::Types<
+    CommonStressTestSyncServer<CommonStressTestInsecure<TestServiceImpl>>,
+    CommonStressTestSyncServer<CommonStressTestInproc<TestServiceImpl>>,
+    CommonStressTestAsyncServer<
+        CommonStressTestInsecure<grpc::testing::EchoTestService::AsyncService>>,
+    CommonStressTestAsyncServer<
+        CommonStressTestInproc<grpc::testing::EchoTestService::AsyncService>>>
+    CommonTypes;
+TYPED_TEST_CASE(End2endTest, CommonTypes);
+TYPED_TEST(End2endTest, ThreadStress) {
+  this->common_.ResetStub();
+  std::vector<std::thread> threads;
   for (int i = 0; i < kNumThreads; ++i) {
-    threads.push_back(new std::thread(SendRpc, common_.GetStub(), kNumRpcs));
+    threads.emplace_back(SendRpc, this->common_.GetStub(), kNumRpcs);
   }
   for (int i = 0; i < kNumThreads; ++i) {
-    threads[i]->join();
-    delete threads[i];
+    threads[i].join();
   }
 }
 
+template <class Common>
 class AsyncClientEnd2endTest : public ::testing::Test {
  protected:
   AsyncClientEnd2endTest() : rpcs_outstanding_(0) {}
 
-  void SetUp() GRPC_OVERRIDE { common_.SetUp(); }
-  void TearDown() GRPC_OVERRIDE {
+  void SetUp() override { common_.SetUp(); }
+  void TearDown() override {
     void* ignored_tag;
     bool ignored_ok;
     while (cq_.Next(&ignored_tag, &ignored_ok))
@@ -254,7 +386,7 @@ class AsyncClientEnd2endTest : public ::testing::Test {
   }
 
   void Wait() {
-    unique_lock<mutex> l(mu_);
+    std::unique_lock<std::mutex> l(mu_);
     while (rpcs_outstanding_ != 0) {
       cv_.wait(l);
     }
@@ -273,13 +405,13 @@ class AsyncClientEnd2endTest : public ::testing::Test {
     for (int i = 0; i < num_rpcs; ++i) {
       AsyncClientCall* call = new AsyncClientCall;
       EchoRequest request;
-      request.set_message("Hello");
+      request.set_message("Hello: " + grpc::to_string(i));
       call->response_reader =
           common_.GetStub()->AsyncEcho(&call->context, request, &cq_);
       call->response_reader->Finish(&call->response, &call->status,
                                     (void*)call);
 
-      unique_lock<mutex> l(mu_);
+      std::unique_lock<std::mutex> l(mu_);
       rpcs_outstanding_++;
     }
   }
@@ -290,12 +422,14 @@ class AsyncClientEnd2endTest : public ::testing::Test {
       bool ok = false;
       if (!cq_.Next(&got_tag, &ok)) break;
       AsyncClientCall* call = static_cast<AsyncClientCall*>(got_tag);
-      GPR_ASSERT(ok);
+      if (!ok) {
+        gpr_log(GPR_DEBUG, "Error: %d", call->status.error_code());
+      }
       delete call;
 
       bool notify;
       {
-        unique_lock<mutex> l(mu_);
+        std::unique_lock<std::mutex> l(mu_);
         rpcs_outstanding_--;
         notify = (rpcs_outstanding_ == 0);
       }
@@ -305,34 +439,34 @@ class AsyncClientEnd2endTest : public ::testing::Test {
     }
   }
 
-  CommonStressTest common_;
+  Common common_;
   CompletionQueue cq_;
-  mutex mu_;
-  condition_variable cv_;
+  std::mutex mu_;
+  std::condition_variable cv_;
   int rpcs_outstanding_;
 };
 
-TEST_F(AsyncClientEnd2endTest, ThreadStress) {
-  common_.ResetStub();
-  std::vector<std::thread*> send_threads, completion_threads;
-  for (int i = 0; i < kNumThreads / 2; ++i) {
-    completion_threads.push_back(new std::thread(
-        &AsyncClientEnd2endTest_ThreadStress_Test::AsyncCompleteRpc, this));
+TYPED_TEST_CASE(AsyncClientEnd2endTest, CommonTypes);
+TYPED_TEST(AsyncClientEnd2endTest, ThreadStress) {
+  this->common_.ResetStub();
+  std::vector<std::thread> send_threads, completion_threads;
+  for (int i = 0; i < kNumAsyncReceiveThreads; ++i) {
+    completion_threads.emplace_back(
+        &AsyncClientEnd2endTest_ThreadStress_Test<TypeParam>::AsyncCompleteRpc,
+        this);
   }
-  for (int i = 0; i < kNumThreads / 2; ++i) {
-    send_threads.push_back(
-        new std::thread(&AsyncClientEnd2endTest_ThreadStress_Test::AsyncSendRpc,
-                        this, kNumRpcs));
+  for (int i = 0; i < kNumAsyncSendThreads; ++i) {
+    send_threads.emplace_back(
+        &AsyncClientEnd2endTest_ThreadStress_Test<TypeParam>::AsyncSendRpc,
+        this, kNumRpcs);
   }
-  for (int i = 0; i < kNumThreads / 2; ++i) {
-    send_threads[i]->join();
-    delete send_threads[i];
+  for (int i = 0; i < kNumAsyncSendThreads; ++i) {
+    send_threads[i].join();
   }
 
-  Wait();
-  for (int i = 0; i < kNumThreads / 2; ++i) {
-    completion_threads[i]->join();
-    delete completion_threads[i];
+  this->Wait();
+  for (int i = 0; i < kNumAsyncReceiveThreads; ++i) {
+    completion_threads[i].join();
   }
 }
 

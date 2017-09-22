@@ -1,56 +1,41 @@
-# Copyright 2015, Google Inc.
-# All rights reserved.
+# Copyright 2015 gRPC authors.
 #
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are
-# met:
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-#     * Redistributions of source code must retain the above copyright
-# notice, this list of conditions and the following disclaimer.
-#     * Redistributions in binary form must reproduce the above
-# copyright notice, this list of conditions and the following disclaimer
-# in the documentation and/or other materials provided with the
-# distribution.
-#     * Neither the name of Google Inc. nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
+#     http://www.apache.org/licenses/LICENSE-2.0
 #
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 cimport cpython
 
 
 cdef class Channel:
 
-  def __cinit__(self, target, ChannelArgs arguments=None,
+  def __cinit__(self, bytes target, ChannelArgs arguments,
                 ChannelCredentials channel_credentials=None):
+    grpc_init()
     cdef grpc_channel_args *c_arguments = NULL
+    cdef char *c_target = NULL
     self.c_channel = NULL
     self.references = []
-    if arguments is not None:
+    if len(arguments) > 0:
       c_arguments = &arguments.c_args
-    if isinstance(target, bytes):
-      pass
-    elif isinstance(target, basestring):
-      target = target.encode()
-    else:
-      raise TypeError("expected target to be str or bytes")
+      self.references.append(arguments)
+    c_target = target
     if channel_credentials is None:
-      self.c_channel = grpc_insecure_channel_create(target, c_arguments,
-                                                         NULL)
+      with nogil:
+        self.c_channel = grpc_insecure_channel_create(c_target, c_arguments,
+                                                      NULL)
     else:
-      self.c_channel = grpc_secure_channel_create(
-          channel_credentials.c_credentials, target, c_arguments, NULL)
+      with nogil:
+        self.c_channel = grpc_secure_channel_create(
+            channel_credentials.c_credentials, c_target, c_arguments, NULL)
       self.references.append(channel_credentials)
     self.references.append(target)
     self.references.append(arguments)
@@ -60,52 +45,54 @@ cdef class Channel:
                   method, host, Timespec deadline not None):
     if queue.is_shutting_down:
       raise ValueError("queue must not be shutting down or shutdown")
-    if isinstance(method, bytes):
-      pass
-    elif isinstance(method, basestring):
-      method = method.encode()
-    else:
-      raise TypeError("expected method to be str or bytes")
-    cdef char *host_c_string = NULL
-    if host is None:
-      pass
-    elif isinstance(host, bytes):
-      host_c_string = host
-    elif isinstance(host, basestring):
-      host = host.encode()
-      host_c_string = host
-    else:
-      raise TypeError("expected host to be str, bytes, or None")
+    cdef grpc_slice method_slice = _slice_from_bytes(method)
+    cdef grpc_slice host_slice
+    cdef grpc_slice *host_slice_ptr = NULL
+    if host is not None:
+      host_slice = _slice_from_bytes(host)
+      host_slice_ptr = &host_slice
     cdef Call operation_call = Call()
-    operation_call.references = [self, method, host, queue]
+    operation_call.references = [self, queue]
     cdef grpc_call *parent_call = NULL
     if parent is not None:
       parent_call = parent.c_call
-    operation_call.c_call = grpc_channel_create_call(
-        self.c_channel, parent_call, flags,
-        queue.c_completion_queue, method, host_c_string, deadline.c_time,
-        NULL)
+    with nogil:
+      operation_call.c_call = grpc_channel_create_call(
+          self.c_channel, parent_call, flags,
+          queue.c_completion_queue, method_slice, host_slice_ptr,
+          deadline.c_time, NULL)
+      grpc_slice_unref(method_slice)
+      if host_slice_ptr:
+        grpc_slice_unref(host_slice)
     return operation_call
 
   def check_connectivity_state(self, bint try_to_connect):
-    return grpc_channel_check_connectivity_state(self.c_channel,
-                                                      try_to_connect)
+    cdef grpc_connectivity_state result
+    with nogil:
+      result = grpc_channel_check_connectivity_state(self.c_channel,
+                                                     try_to_connect)
+    return result
 
   def watch_connectivity_state(
-      self, last_observed_state, Timespec deadline not None,
-      CompletionQueue queue not None, tag):
+      self, grpc_connectivity_state last_observed_state,
+      Timespec deadline not None, CompletionQueue queue not None, tag):
     cdef OperationTag operation_tag = OperationTag(tag)
     cpython.Py_INCREF(operation_tag)
-    grpc_channel_watch_connectivity_state(
-        self.c_channel, last_observed_state, deadline.c_time,
-        queue.c_completion_queue, <cpython.PyObject *>operation_tag)
+    with nogil:
+      grpc_channel_watch_connectivity_state(
+          self.c_channel, last_observed_state, deadline.c_time,
+          queue.c_completion_queue, <cpython.PyObject *>operation_tag)
 
   def target(self):
-    cdef char * target = grpc_channel_get_target(self.c_channel)
+    cdef char *target = NULL
+    with nogil:
+      target = grpc_channel_get_target(self.c_channel)
     result = <bytes>target
-    gpr_free(target)
+    with nogil:
+      gpr_free(target)
     return result
 
   def __dealloc__(self):
     if self.c_channel != NULL:
       grpc_channel_destroy(self.c_channel)
+    grpc_shutdown()

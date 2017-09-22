@@ -1,55 +1,55 @@
 /*
  *
- * Copyright 2015, Google Inc.
- * All rights reserved.
+ * Copyright 2015 gRPC authors.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are
- * met:
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- *     * Redistributions of source code must retain the above copyright
- * notice, this list of conditions and the following disclaimer.
- *     * Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following disclaimer
- * in the documentation and/or other materials provided with the
- * distribution.
- *     * Neither the name of Google Inc. nor the names of its
- * contributors may be used to endorse or promote products derived from
- * this software without specific prior written permission.
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
- * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
- * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
- * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
- * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
- * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
- * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  *
  */
 
 #import "GRPCCall.h"
 
+#import "GRPCCall+OAuth2.h"
+
 #include <grpc/grpc.h>
 #include <grpc/support/time.h>
 #import <RxLibrary/GRXConcurrentWriteable.h>
+#import <RxLibrary/GRXImmediateSingleWriter.h>
 
+#import "private/GRPCConnectivityMonitor.h"
+#import "private/GRPCHost.h"
 #import "private/GRPCRequestHeaders.h"
 #import "private/GRPCWrappedCall.h"
 #import "private/NSData+GRPC.h"
 #import "private/NSDictionary+GRPC.h"
 #import "private/NSError+GRPC.h"
 
+// At most 6 ops can be in an op batch for a client: SEND_INITIAL_METADATA,
+// SEND_MESSAGE, SEND_CLOSE_FROM_CLIENT, RECV_INITIAL_METADATA, RECV_MESSAGE,
+// and RECV_STATUS_ON_CLIENT.
+NSInteger kMaxClientBatch = 6;
+
 NSString * const kGRPCHeadersKey = @"io.grpc.HeadersKey";
 NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
+static NSMutableDictionary *callFlags;
+
+static NSString * const kAuthorizationHeader = @"authorization";
+static NSString * const kBearerPrefix = @"Bearer ";
 
 @interface GRPCCall () <GRXWriteable>
 // Make them read-write.
 @property(atomic, strong) NSDictionary *responseHeaders;
 @property(atomic, strong) NSDictionary *responseTrailers;
+@property(atomic) BOOL isWaitingForToken;
 @end
 
 // The following methods of a C gRPC call object aren't reentrant, and thus
@@ -71,8 +71,10 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
 @implementation GRPCCall {
   dispatch_queue_t _callQueue;
 
+  NSString *_host;
+  NSString *_path;
   GRPCWrappedCall *_wrappedCall;
-  dispatch_once_t _callAlreadyInvoked;
+  GRPCConnectivityMonitor *_connectivityMonitor;
 
   // The C gRPC library has less guarantees on the ordering of events than we
   // do. Particularly, in the face of errors, there's no ordering guarantee at
@@ -95,9 +97,48 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
   GRPCCall *_retainSelf;
 
   GRPCRequestHeaders *_requestHeaders;
+
+  // In the case that the call is a unary call (i.e. the writer to GRPCCall is of type
+  // GRXImmediateSingleWriter), GRPCCall will delay sending ops (not send them to C core
+  // immediately) and buffer them into a batch _unaryOpBatch. The batch is sent to C core when
+  // the SendClose op is added.
+  BOOL _unaryCall;
+  NSMutableArray *_unaryOpBatch;
+
+  // The dispatch queue to be used for enqueuing responses to user. Defaulted to the main dispatch
+  // queue
+  dispatch_queue_t _responseQueue;
 }
 
 @synthesize state = _state;
+
+// TODO(jcanizales): If grpc_init is idempotent, this should be changed from load to initialize.
++ (void)load {
+  grpc_init();
+  callFlags = [NSMutableDictionary dictionary];
+}
+
++ (void)setCallSafety:(GRPCCallSafety)callSafety host:(NSString *)host path:(NSString *)path {
+  NSString *hostAndPath = [NSString stringWithFormat:@"%@/%@", host, path];
+  switch (callSafety) {
+    case GRPCCallSafetyDefault:
+      callFlags[hostAndPath] = @0;
+      break;
+    case GRPCCallSafetyIdempotentRequest:
+      callFlags[hostAndPath] = @GRPC_INITIAL_METADATA_IDEMPOTENT_REQUEST;
+      break;
+    case GRPCCallSafetyCacheableRequest:
+      callFlags[hostAndPath] = @GRPC_INITIAL_METADATA_CACHEABLE_REQUEST;
+      break;
+    default:
+      break;
+  }
+}
+
++ (uint32_t)callFlagsForHost:(NSString *)host path:(NSString *)path {
+  NSString *hostAndPath = [NSString stringWithFormat:@"%@/%@", host, path];
+  return [callFlags[hostAndPath] intValue];
+}
 
 - (instancetype)init {
   return [self initWithHost:nil path:nil requestsWriter:nil];
@@ -115,24 +156,40 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
                 format:@"The requests writer can't be already started."];
   }
   if ((self = [super init])) {
-    _wrappedCall = [[GRPCWrappedCall alloc] initWithHost:host path:path];
-    if (!_wrappedCall) {
-      return nil;
-    }
+    _host = [host copy];
+    _path = [path copy];
 
     // Serial queue to invoke the non-reentrant methods of the grpc_call object.
-    _callQueue = dispatch_queue_create("org.grpc.call", NULL);
+    _callQueue = dispatch_queue_create("io.grpc.call", NULL);
 
     _requestWriter = requestWriter;
 
     _requestHeaders = [[GRPCRequestHeaders alloc] initWithCall:self];
+
+    if ([requestWriter isKindOfClass:[GRXImmediateSingleWriter class]]) {
+      _unaryCall = YES;
+      _unaryOpBatch = [NSMutableArray arrayWithCapacity:kMaxClientBatch];
+    }
+
+    _responseQueue = dispatch_get_main_queue();
   }
   return self;
+}
+
+- (void)setResponseDispatchQueue:(dispatch_queue_t)queue {
+  if (_state != GRXWriterStateNotStarted) {
+    return;
+  }
+  _responseQueue = queue;
 }
 
 #pragma mark Finish
 
 - (void)finishWithError:(NSError *)errorOrNil {
+  @synchronized(self) {
+    _state = GRXWriterStateFinished;
+  }
+
   // If the call isn't retained anywhere else, it can be deallocated now.
   _retainSelf = nil;
 
@@ -156,8 +213,12 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
 - (void)cancel {
   [self finishWithError:[NSError errorWithDomain:kGRPCErrorDomain
                                             code:GRPCErrorCodeCancelled
-                                        userInfo:nil]];
-  [self cancelCall];
+                                        userInfo:@{NSLocalizedDescriptionKey: @"Canceled by app"}]];
+  if (!self.isWaitingForToken) {
+    [self cancelCall];
+  } else {
+    self.isWaitingForToken = NO;
+  }
 }
 
 - (void)dealloc {
@@ -202,13 +263,9 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
         // don't want to throw, because the app shouldn't crash for a behavior
         // that's on the hands of any server to have. Instead we finish and ask
         // the server to cancel.
-        //
-        // TODO(jcanizales): No canonical code is appropriate for this situation
-        // (because it's just a client problem). Use another domain and an
-        // appropriately-documented code.
         [weakSelf finishWithError:[NSError errorWithDomain:kGRPCErrorDomain
-                                                      code:GRPCErrorCodeInternal
-                                                  userInfo:nil]];
+                                                      code:GRPCErrorCodeResourceExhausted
+                                                  userInfo:@{NSLocalizedDescriptionKey: @"Client does not have enough memory to hold the server response."}]];
         [weakSelf cancelCall];
         return;
       }
@@ -223,14 +280,22 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
 
 - (void)sendHeaders:(NSDictionary *)headers {
   // TODO(jcanizales): Add error handlers for async failures
-  [_wrappedCall startBatchWithOperations:@[[[GRPCOpSendMetadata alloc] initWithMetadata:headers
-                                                                                handler:nil]]];
+  GRPCOpSendMetadata *op = [[GRPCOpSendMetadata alloc] initWithMetadata:headers
+                                                                  flags:[GRPCCall callFlagsForHost:_host path:_path]
+                                                                handler:nil];  // No clean-up needed after SEND_INITIAL_METADATA
+  if (!_unaryCall) {
+    [_wrappedCall startBatchWithOperations:@[op]];
+  } else {
+    [_unaryOpBatch addObject:op];
+  }
 }
 
 #pragma mark GRXWriteable implementation
 
 // Only called from the call queue. The error handler will be called from the
 // network queue if the write didn't succeed.
+// If the call is a unary call, parameter \a errorHandler will be ignored and
+// the error handler of GRPCOpSendClose will be executed in case of error.
 - (void)writeMessage:(NSData *)message withErrorHandler:(void (^)())errorHandler {
 
   __weak GRPCCall *weakSelf = self;
@@ -243,9 +308,17 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
       }
     }
   };
-  [_wrappedCall startBatchWithOperations:@[[[GRPCOpSendMessage alloc] initWithMessage:message
-                                                                              handler:resumingHandler]]
-                            errorHandler:errorHandler];
+
+  GRPCOpSendMessage *op = [[GRPCOpSendMessage alloc] initWithMessage:message
+                                                             handler:resumingHandler];
+  if (!_unaryCall) {
+    [_wrappedCall startBatchWithOperations:@[op]
+                              errorHandler:errorHandler];
+  } else {
+    // Ignored errorHandler since it is the same as the one for GRPCOpSendClose.
+    // TODO (mxyan): unify the error handlers of all Ops into a single closure.
+    [_unaryOpBatch addObject:op];
+  }
 }
 
 - (void)writeValue:(id)value {
@@ -270,8 +343,14 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
 // Only called from the call queue. The error handler will be called from the
 // network queue if the requests stream couldn't be closed successfully.
 - (void)finishRequestWithErrorHandler:(void (^)())errorHandler {
-  [_wrappedCall startBatchWithOperations:@[[[GRPCOpSendClose alloc] init]]
-                            errorHandler:errorHandler];
+  if (!_unaryCall) {
+    [_wrappedCall startBatchWithOperations:@[[[GRPCOpSendClose alloc] init]]
+                              errorHandler:errorHandler];
+  } else {
+    [_unaryOpBatch addObject:[[GRPCOpSendClose alloc] init]];
+    [_wrappedCall startBatchWithOperations:_unaryOpBatch
+                              errorHandler:errorHandler];
+  }
 }
 
 - (void)writesFinishedWithError:(NSError *)errorOrNil {
@@ -305,37 +384,30 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
 }
 
 - (void)invokeCall {
-  __weak GRPCCall *weakSelf = self;
   [self invokeCallWithHeadersHandler:^(NSDictionary *headers) {
     // Response headers received.
-    GRPCCall *strongSelf = weakSelf;
-    if (strongSelf) {
-      strongSelf.responseHeaders = headers;
-      [strongSelf startNextRead];
-    }
+    self.responseHeaders = headers;
+    [self startNextRead];
   } completionHandler:^(NSError *error, NSDictionary *trailers) {
-    GRPCCall *strongSelf = weakSelf;
-    if (strongSelf) {
-      strongSelf.responseTrailers = trailers;
+    self.responseTrailers = trailers;
 
-      if (error) {
-        NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
-        if (error.userInfo) {
-          [userInfo addEntriesFromDictionary:error.userInfo];
-        }
-        userInfo[kGRPCTrailersKey] = strongSelf.responseTrailers;
-        // TODO(jcanizales): The C gRPC library doesn't guarantee that the headers block will be
-        // called before this one, so an error might end up with trailers but no headers. We
-        // shouldn't call finishWithError until ater both blocks are called. It is also when this is
-        // done that we can provide a merged view of response headers and trailers in a thread-safe
-        // way.
-        if (strongSelf.responseHeaders) {
-          userInfo[kGRPCHeadersKey] = strongSelf.responseHeaders;
-        }
-        error = [NSError errorWithDomain:error.domain code:error.code userInfo:userInfo];
+    if (error) {
+      NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
+      if (error.userInfo) {
+        [userInfo addEntriesFromDictionary:error.userInfo];
       }
-      [strongSelf finishWithError:error];
+      userInfo[kGRPCTrailersKey] = self.responseTrailers;
+      // TODO(jcanizales): The C gRPC library doesn't guarantee that the headers block will be
+      // called before this one, so an error might end up with trailers but no headers. We
+      // shouldn't call finishWithError until ater both blocks are called. It is also when this is
+      // done that we can provide a merged view of response headers and trailers in a thread-safe
+      // way.
+      if (self.responseHeaders) {
+        userInfo[kGRPCHeadersKey] = self.responseHeaders;
+      }
+      error = [NSError errorWithDomain:error.domain code:error.code userInfo:userInfo];
     }
+    [self finishWithError:error];
   }];
   // Now that the RPC has been initiated, request writes can start.
   @synchronized(_requestWriter) {
@@ -345,7 +417,42 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
 
 #pragma mark GRXWriter implementation
 
+- (void)startCallWithWriteable:(id<GRXWriteable>)writeable {
+  _responseWriteable = [[GRXConcurrentWriteable alloc] initWithWriteable:writeable
+                                                           dispatchQueue:_responseQueue];
+
+  _wrappedCall = [[GRPCWrappedCall alloc] initWithHost:_host
+                                            serverName:_serverName
+                                                  path:_path
+                                               timeout:_timeout];
+  NSAssert(_wrappedCall, @"Error allocating RPC objects. Low memory?");
+
+  [self sendHeaders:_requestHeaders];
+  [self invokeCall];
+
+  // TODO(jcanizales): Extract this logic somewhere common.
+  NSString *host = [NSURL URLWithString:[@"https://" stringByAppendingString:_host]].host;
+  if (!host) {
+    // TODO(jcanizales): Check this on init.
+    [NSException raise:NSInvalidArgumentException format:@"host of %@ is nil", _host];
+  }
+  _connectivityMonitor = [GRPCConnectivityMonitor monitorWithHost:host];
+  __weak typeof(self) weakSelf = self;
+  void (^handler)() = ^{
+    typeof(self) strongSelf = weakSelf;
+    [strongSelf finishWithError:[NSError errorWithDomain:kGRPCErrorDomain
+                                                    code:GRPCErrorCodeUnavailable
+                                                userInfo:@{ NSLocalizedDescriptionKey : @"Connectivity lost." }]];
+  };
+  [_connectivityMonitor handleLossWithHandler:handler
+                      wifiStatusChangeHandler:nil];
+}
+
 - (void)startWithWriteable:(id<GRXWriteable>)writeable {
+  @synchronized(self) {
+    _state = GRXWriterStateStarted;
+  }
+
   // Create a retain cycle so that this instance lives until the RPC finishes (or is cancelled).
   // This makes RPCs in which the call isn't externally retained possible (as long as it is started
   // before being autoreleased).
@@ -353,36 +460,53 @@ NSString * const kGRPCTrailersKey = @"io.grpc.TrailersKey";
   // that the life of the instance is determined by this retain cycle.
   _retainSelf = self;
 
-  _responseWriteable = [[GRXConcurrentWriteable alloc] initWithWriteable:writeable];
-  [self sendHeaders:_requestHeaders];
-  [self invokeCall];
+  if (self.tokenProvider != nil) {
+    self.isWaitingForToken = YES;
+    __weak typeof(self) weakSelf = self;
+    [self.tokenProvider getTokenWithHandler:^(NSString *token){
+      typeof(self) strongSelf = weakSelf;
+      if (strongSelf && strongSelf.isWaitingForToken) {
+        if (token) {
+          NSString *t = [kBearerPrefix stringByAppendingString:token];
+          strongSelf.requestHeaders[kAuthorizationHeader] = t;
+        }
+        [strongSelf startCallWithWriteable:writeable];
+        strongSelf.isWaitingForToken = NO;
+      }
+    }];
+  } else {
+    [self startCallWithWriteable:writeable];
+  }
 }
 
 - (void)setState:(GRXWriterState)newState {
-  // Manual transitions are only allowed from the started or paused states.
-  if (_state == GRXWriterStateNotStarted || _state == GRXWriterStateFinished) {
-    return;
-  }
+  @synchronized(self) {
+    // Manual transitions are only allowed from the started or paused states.
+    if (_state == GRXWriterStateNotStarted || _state == GRXWriterStateFinished) {
+      return;
+    }
 
-  switch (newState) {
-    case GRXWriterStateFinished:
-      _state = newState;
-      // Per GRXWriter's contract, setting the state to Finished manually
-      // means one doesn't wish the writeable to be messaged anymore.
-      [_responseWriteable cancelSilently];
-      _responseWriteable = nil;
-      return;
-    case GRXWriterStatePaused:
-      _state = newState;
-      return;
-    case GRXWriterStateStarted:
-      if (_state == GRXWriterStatePaused) {
+    switch (newState) {
+      case GRXWriterStateFinished:
         _state = newState;
-        [self startNextRead];
-      }
-      return;
-    case GRXWriterStateNotStarted:
-      return;
+        // Per GRXWriter's contract, setting the state to Finished manually
+        // means one doesn't wish the writeable to be messaged anymore.
+        [_responseWriteable cancelSilently];
+        _responseWriteable = nil;
+        return;
+      case GRXWriterStatePaused:
+        _state = newState;
+        return;
+      case GRXWriterStateStarted:
+        if (_state == GRXWriterStatePaused) {
+          _state = newState;
+          [self startNextRead];
+        }
+        return;
+      case GRXWriterStateNotStarted:
+        return;
+    }
   }
 }
+
 @end
